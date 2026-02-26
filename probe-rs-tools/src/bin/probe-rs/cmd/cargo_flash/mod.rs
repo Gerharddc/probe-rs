@@ -95,13 +95,13 @@ pub async fn main(args: Vec<OsString>, config: Config) -> anyhow::Result<()> {
     let _log_guard = setup_logging(None, opt.log);
 
     #[cfg(feature = "remote")]
-    let connection_params = opt
+    let connection_params: Option<crate::ConnectionParams> = opt
         .host
         .as_ref()
-        .map(|host| (host.clone(), opt.token.clone()));
+        .map(|host| crate::ConnectionParams::Tcp(host.clone(), opt.token.clone()));
 
     #[cfg(not(feature = "remote"))]
-    let connection_params = None;
+    let connection_params = ();
 
     let terminate = run_app(connection_params, async |mut client| {
         let main_result = main_try(&mut client, opt).await;

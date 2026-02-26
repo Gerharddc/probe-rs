@@ -30,6 +30,13 @@ use crate::util::parse_u64;
 
 const MAX_LOG_FILES: usize = 20;
 
+#[cfg(feature = "remote")]
+enum ConnectionParams {
+    Tcp(String, Option<String>),
+    #[cfg(unix)]
+    UnixSocket(PathBuf, Option<String>),
+}
+
 type ConfigPreset = HashMap<String, Value>;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -88,6 +95,16 @@ struct Cli {
         help_heading = "REMOTE CONFIGURATION"
     )]
     token: Option<String>,
+
+    /// Unix socket to connect to (Unix only)
+    #[cfg(all(feature = "remote", unix))]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "REMOTE CONFIGURATION",
+        conflicts_with = "host"
+    )]
+    unix_socket: Option<PathBuf>,
 
     #[clap(subcommand)]
     subcommand: Subcommand,
@@ -566,15 +583,30 @@ async fn main() -> Result<()> {
     let elf = cli.elf();
     let report_path = cli.report.clone();
 
-    #[cfg(feature = "remote")]
-    let connection_params = cli
+    #[cfg(all(feature = "remote", unix))]
+    let connection_params: Option<ConnectionParams> = {
+        if let Some(ref socket_path) = cli.unix_socket {
+            Some(ConnectionParams::UnixSocket(socket_path.clone(), cli.token.clone()))
+        } else if let Some(ref host) = cli.host {
+            Some(ConnectionParams::Tcp(host.clone(), cli.token.clone()))
+        } else {
+            None
+        }
+    };
+
+    #[cfg(all(feature = "remote", not(unix)))]
+    let connection_params: Option<ConnectionParams> = cli
         .host
         .as_ref()
-        .map(|host| (host.clone(), cli.token.clone()));
+        .map(|host| ConnectionParams::Tcp(host.clone(), cli.token.clone()));
 
     #[cfg(not(feature = "remote"))]
-    let connection_params = None;
+    let connection_params = ();
 
+    #[cfg(not(feature = "remote"))]
+    let is_local = true;
+
+    #[cfg(feature = "remote")]
     let is_local = connection_params.is_none();
 
     let result = run_app(connection_params, async |client| {
@@ -595,18 +627,44 @@ async fn main() -> Result<()> {
 }
 
 /// Runs the callback using either a local or remote RPC client.
+#[cfg(feature = "remote")]
 async fn run_app<R>(
-    _connection_params: Option<(String, Option<String>)>,
+    _connection_params: Option<ConnectionParams>,
     cb: impl AsyncFnOnce(RpcClient) -> Result<R>,
 ) -> Result<R> {
     #[cfg(feature = "remote")]
-    if let Some((host, token)) = _connection_params {
-        // Run the command remotely.
-        let client = rpc::client::connect(&host, token).await?;
-
-        return cb(client).await;
+    match _connection_params {
+        Some(ConnectionParams::Tcp(host, token)) => {
+            let client = rpc::client::connect(&host, token).await?;
+            return cb(client).await;
+        }
+        #[cfg(unix)]
+        Some(ConnectionParams::UnixSocket(path, token)) => {
+            let client = rpc::client::connect_unix(&path, token).await?;
+            return cb(client).await;
+        }
+        None => {}
     }
 
+    // Create a local server to run commands against.
+    let (mut local_server, tx, rx) = RpcApp::create_server(16, rpc::functions::ProbeAccess::All);
+    let handle = tokio::spawn(async move { local_server.run().await });
+
+    // Run the command locally.
+    let client = RpcClient::new_local_from_wire(tx, rx);
+    let result = cb(client).await;
+
+    // Wait for the server to shut down
+    _ = handle.await.unwrap();
+
+    result
+}
+
+#[cfg(not(feature = "remote"))]
+async fn run_app<R>(
+    _connection_params: (),
+    cb: impl AsyncFnOnce(RpcClient) -> Result<R>,
+) -> Result<R> {
     // Create a local server to run commands against.
     let (mut local_server, tx, rx) = RpcApp::create_server(16, rpc::functions::ProbeAccess::All);
     let handle = tokio::spawn(async move { local_server.run().await });

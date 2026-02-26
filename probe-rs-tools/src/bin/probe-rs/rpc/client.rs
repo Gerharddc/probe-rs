@@ -144,6 +144,61 @@ pub async fn connect(host: &str, token: Option<String>) -> anyhow::Result<RpcCli
     ))
 }
 
+#[cfg(all(feature = "remote", unix))]
+pub async fn connect_unix(path: &Path, token: Option<String>) -> anyhow::Result<RpcClient> {
+    use crate::rpc::transport::websocket::{WebsocketRx, WebsocketTx};
+    use anyhow::Context;
+    use futures_util::StreamExt as _;
+    use sha2::{Digest, Sha512};
+    use tokio::net::UnixStream;
+    use tokio_tungstenite::{
+        tungstenite::protocol::Role,
+        tungstenite::Message,
+        WebSocketStream,
+    };
+    use tokio_util::bytes::Bytes;
+
+    let stream = UnixStream::connect(path)
+        .await
+        .context("Failed to connect to Unix socket")?;
+
+    // Perform WebSocket handshake manually
+    let ws_stream = WebSocketStream::from_raw_socket(stream, Role::Client, None)
+        .await;
+
+    let (write, read) = ws_stream.split();
+
+    // Receive challenge from server (first message, text format)
+    let mut reader = read.map(|message| {
+        message.map(|message| match message {
+            Message::Binary(binary) => binary,
+            Message::Text(text) => Bytes::copy_from_slice(text.as_bytes()),
+            _ => Bytes::new(),
+        })
+    });
+
+    let Some(Ok(challenge)) = reader.next().await else {
+        anyhow::bail!("Server did not send challenge");
+    };
+
+    let challenge_str = String::from_utf8(challenge.to_vec()).context("Invalid challenge")?;
+
+    let mut hasher = Sha512::new();
+    hasher.update(challenge_str.as_bytes());
+    hasher.update(token.unwrap_or_default().as_bytes());
+    let challenge_response = hasher.finalize().to_vec();
+
+    let tx = WebsocketTx::new(write);
+    tx.send(challenge_response)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to send challenge response: {err:?}"))?;
+
+    Ok(RpcClient::new_from_wire(
+        tx,
+        WebsocketRx::new(reader),
+    ))
+}
+
 #[cfg(feature = "remote")]
 mod tls {
     use rustls::DigitallySignedStruct;
