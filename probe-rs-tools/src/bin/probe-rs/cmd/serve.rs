@@ -22,7 +22,7 @@ use sha2::{Digest, Sha512};
 use tokio::task::LocalSet;
 use tokio_util::bytes::Bytes;
 
-use std::{fmt::Write, sync::Arc};
+use std::{fmt::Write, path::PathBuf, sync::Arc};
 
 use crate::rpc::{
     functions::{ProbeAccess, RpcApp},
@@ -35,6 +35,25 @@ pub(crate) struct ServerConfig {
     pub users: Vec<ServerUser>,
     pub address: Option<String>,
     pub port: Option<u16>,
+    pub unix_socket: Option<PathBuf>,
+}
+
+impl ServerConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let has_tcp = self.address.is_some() || self.port.is_some();
+        let has_unix = self.unix_socket.is_some();
+
+        if has_tcp && has_unix {
+            anyhow::bail!("Cannot specify both TCP (address/port) and Unix socket");
+        }
+
+        #[cfg(not(unix))]
+        if has_unix {
+            anyhow::bail!("Unix sockets not supported on this platform");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,10 +111,27 @@ pub struct Cmd {}
 
 impl Cmd {
     pub async fn run(self, config: ServerConfig) -> anyhow::Result<()> {
+        config.validate()?;
+
         if config.users.is_empty() {
             tracing::warn!("No users configured.");
         }
 
+        #[cfg(unix)]
+        if let Some(socket_path) = &config.unix_socket {
+            let socket_path = socket_path.clone();
+            return self.run_unix(&socket_path, config).await;
+        }
+
+        #[cfg(not(unix))]
+        if config.unix_socket.is_some() {
+            anyhow::bail!("Unix sockets not supported on this platform");
+        }
+
+        self.run_tcp(config).await
+    }
+
+    async fn run_tcp(self, config: ServerConfig) -> anyhow::Result<()> {
         let address = config.address.as_deref().unwrap_or("0.0.0.0");
         let port = config.port.unwrap_or(3000);
 
@@ -134,6 +170,39 @@ impl Cmd {
 
         Ok(())
     }
+
+    #[cfg(unix)]
+    async fn run_unix(self, socket_path: &PathBuf, _config: ServerConfig) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if socket_path.exists() {
+            tracing::info!("removing existing unix socket for server");
+            std::fs::remove_file(socket_path)?;
+        }
+
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
+
+        let mut perms = std::fs::metadata(socket_path)?.permissions();
+        perms.set_mode(0o660);
+        std::fs::set_permissions(socket_path, perms)?;
+
+        tracing::info!("listening on {}", socket_path.display());
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    // Spawn a new task for each connection
+                    tokio::spawn(handle_unix_rpc(stream));
+                }
+                Err(e) => {
+                    tracing::error!("Accept error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, state: State<Arc<ServerState>>) -> impl IntoResponse {
@@ -161,6 +230,8 @@ async fn ws_handler(ws: WebSocketUpgrade, state: State<Arc<ServerState>>) -> imp
 
     response
 }
+
+static SERVER_DEPTH: usize = 16;
 
 /// Actual websocket state machine (one will be spawned per connection on the local set)
 async fn handle_socket(socket: WebSocket, challenge: String, state: Arc<ServerState>) {
@@ -199,7 +270,7 @@ async fn handle_socket(socket: WebSocket, challenge: String, state: Arc<ServerSt
 
     tracing::info!("User {} connected", user.name);
 
-    let (mut server, tx, mut rx) = RpcApp::create_server(16, user.access.clone());
+    let (mut server, tx, mut rx) = RpcApp::create_server(SERVER_DEPTH, user.access.clone());
 
     // Connect the server's channels to the websocket connection
     let sender = async {
@@ -216,6 +287,51 @@ async fn handle_socket(socket: WebSocket, challenge: String, state: Arc<ServerSt
             tx.send(msg.map_err(|_| WireRxErrorKind::Other))
                 .await
                 .unwrap();
+        }
+    };
+
+    tokio::select! {
+        _ = server.run() => tracing::warn!("Server stopped"),
+        _ = sender => tracing::warn!("Server sender stopped"),
+        _ = receiver => tracing::info!("Client disconnected"),
+    }
+}
+
+#[cfg(unix)]
+async fn handle_unix_rpc(stream: tokio::net::UnixStream) {
+    use crate::rpc::transport::memory::{PostcardReceiver, PostcardSender};
+    use crate::rpc::transport::unix::{UnixStreamRx, UnixStreamTx};
+
+    tracing::info!("Unix socket client connected");
+
+    let (reader, writer) = stream.into_split();
+    let (mut server, tx, mut rx) = RpcApp::create_server(SERVER_DEPTH, ProbeAccess::All);
+
+    // Connect the server's channels to the unix socket connection
+    let sender = async {
+        let writer = UnixStreamTx::new(writer);
+
+        // Send messages from the server to the client.
+        while let Some(msg) = rx.recv().await {
+            if writer.send(msg).await.is_err() {
+                tracing::error!("Failed to send msg to unix socket, terminating sender loop.");
+                break;
+            }
+        }
+    };
+
+    let receiver = async {
+        let mut reader = UnixStreamRx::new(reader);
+
+        // Forward messages from the client to the server.
+        loop {
+            let msg = reader.receive().await;
+            if tx.send(msg).await.is_err() {
+                tracing::error!(
+                    "Failed to forward msg from unix socket, terminating receiver loop."
+                );
+                break;
+            }
         }
     };
 

@@ -14,7 +14,7 @@ use crate::util::common_options::{
 };
 use crate::util::logging::{LevelFilter, setup_logging};
 use crate::util::{cli, logging};
-use crate::{Config, parse_and_resolve_cli_args, run_app};
+use crate::{Config, ConnectionParams, parse_and_resolve_cli_args, run_app};
 
 /// Common options when flashing a target device.
 #[derive(Debug, clap::Parser)]
@@ -75,6 +75,16 @@ struct CliOptions {
     )]
     token: Option<String>,
 
+    /// Unix socket to connect to (Unix only)
+    #[cfg(all(feature = "remote", unix))]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "REMOTE CONFIGURATION",
+        conflicts_with = "host"
+    )]
+    unix_socket: Option<PathBuf>,
+
     /// A configuration preset to apply.
     ///
     /// A preset is a list of command line arguments, that can be defined in the configuration file.
@@ -87,6 +97,17 @@ struct CliOptions {
     preset: Option<String>,
 }
 
+impl CliOptions {
+    #[cfg(feature = "remote")]
+    fn unix_socket(&self) -> Option<&PathBuf> {
+        #[cfg(unix)]
+        return self.unix_socket.as_ref();
+
+        #[cfg(not(unix))]
+        return None;
+    }
+}
+
 pub async fn main(args: Vec<OsString>, config: Config) -> anyhow::Result<()> {
     // Parse the commandline options.
     let opt = parse_and_resolve_cli_args::<CliOptions>(args, &config)?;
@@ -95,13 +116,18 @@ pub async fn main(args: Vec<OsString>, config: Config) -> anyhow::Result<()> {
     let _log_guard = setup_logging(None, opt.log);
 
     #[cfg(feature = "remote")]
-    let connection_params = opt
-        .host
-        .as_ref()
-        .map(|host| (host.clone(), opt.token.clone()));
+    let connection_params = {
+        if let Some(socket_path) = opt.unix_socket() {
+            ConnectionParams::_Unix(socket_path.clone())
+        } else if let Some(ref host) = opt.host {
+            ConnectionParams::_Tcp(host.clone(), opt.token.clone())
+        } else {
+            ConnectionParams::None
+        }
+    };
 
     #[cfg(not(feature = "remote"))]
-    let connection_params = None;
+    let connection_params = ConnectionParams::None;
 
     let terminate = run_app(connection_params, async |mut client| {
         let main_result = main_try(&mut client, opt).await;

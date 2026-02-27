@@ -144,6 +144,23 @@ pub async fn connect(host: &str, token: Option<String>) -> anyhow::Result<RpcCli
     ))
 }
 
+#[cfg(all(feature = "remote", unix))]
+pub async fn connect_unix(path: &Path) -> anyhow::Result<RpcClient> {
+    use crate::rpc::transport::unix::{UnixStreamRx, UnixStreamTx};
+    use anyhow::Context;
+
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .context("Failed to connect to Unix socket")?;
+
+    let (reader, writer) = stream.into_split();
+
+    let tx = UnixStreamTx::new(writer);
+    let rx = UnixStreamRx::new(reader);
+
+    Ok(RpcClient::new_from_wire(tx, rx))
+}
+
 #[cfg(feature = "remote")]
 mod tls {
     use rustls::DigitallySignedStruct;
